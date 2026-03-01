@@ -131,8 +131,8 @@ class LocalREPL(NonIsolatedEnv):
         setup_code: str | None = None,
         persistent: bool = False,
         depth: int = 1,
-        subcall_fn: Callable[[str, str | None], RLMChatCompletion] | None = None,
-        subcall_batched_fn: Callable[[list[str], str | None], list[RLMChatCompletion]] | None = None,
+        subcall_fn: Callable[[str, str | None, float | None], RLMChatCompletion] | None = None,
+        subcall_batched_fn: Callable[[list[str], str | None, list[float] | None], list[RLMChatCompletion]] | None = None,
         custom_tools: dict[str, Any] | None = None,
         custom_sub_tools: dict[str, Any] | None = None,
         compaction: bool = False,
@@ -295,7 +295,7 @@ class LocalREPL(NonIsolatedEnv):
         except Exception as e:
             return [f"Error: LM query failed - {e}"] * len(prompts)
 
-    def _rlm_query(self, prompt: str, model: str | None = None) -> str:
+    def _rlm_query(self, prompt: str, model: str | None = None, budget: float | None = None) -> str:
         """Spawn a recursive RLM sub-call for deeper thinking on a subtask.
 
         When a subcall callback is available (max_depth > 1), this spawns a child
@@ -305,10 +305,11 @@ class LocalREPL(NonIsolatedEnv):
         Args:
             prompt: The prompt to send to the child RLM.
             model: Optional model name override for the child.
+            budget: Optional budget cap (USD) for the child RLM.
         """
         if self.subcall_fn is not None:
             try:
-                completion = self.subcall_fn(prompt, model)
+                completion = self.subcall_fn(prompt, model, budget)
                 self._pending_llm_calls.append(completion)
                 return completion.response
             except Exception as e:
@@ -317,7 +318,7 @@ class LocalREPL(NonIsolatedEnv):
         # Fall back to plain LM call if no recursive capability
         return self._llm_query(prompt, model)
 
-    def _rlm_query_batched(self, prompts: list[str], model: str | None = None) -> list[str]:
+    def _rlm_query_batched(self, prompts: list[str], model: str | None = None, budgets: list[float] | None = None) -> list[str]:
         """Spawn recursive RLM sub-calls for multiple prompts.
 
         Each prompt gets its own child RLM for deeper thinking.
@@ -328,6 +329,7 @@ class LocalREPL(NonIsolatedEnv):
         Args:
             prompts: List of prompts for child RLMs.
             model: Optional model name override for the children.
+            budgets: Optional per-child budget caps (USD).
 
         Returns:
             List of responses in the same order as input prompts.
@@ -335,7 +337,7 @@ class LocalREPL(NonIsolatedEnv):
         # Prefer concurrent batched subcalls
         if self.subcall_batched_fn is not None:
             try:
-                completions = self.subcall_batched_fn(prompts, model)
+                completions = self.subcall_batched_fn(prompts, model, budgets)
                 for c in completions:
                     self._pending_llm_calls.append(c)
                 return [c.response for c in completions]
@@ -345,9 +347,10 @@ class LocalREPL(NonIsolatedEnv):
         # Sequential fallback
         if self.subcall_fn is not None:
             results = []
-            for prompt in prompts:
+            for i, prompt in enumerate(prompts):
                 try:
-                    completion = self.subcall_fn(prompt, model)
+                    child_budget = budgets[i] if budgets is not None else None
+                    completion = self.subcall_fn(prompt, model, child_budget)
                     self._pending_llm_calls.append(completion)
                     results.append(completion.response)
                 except Exception as e:

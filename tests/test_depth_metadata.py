@@ -260,16 +260,13 @@ class TestDepth1LimitChecks:
             max_budget=0.01,
         )
 
+        # Handler cost is synced into the accumulator in _completion_turn
+        # before _check_iteration_limits is called, so simulate that here.
+        rlm._cost_accumulator.add_cost(0.05)
+
         mock_handler = Mock()
         mock_handler.get_usage_summary.return_value = UsageSummary(
-            model_usage_summaries={
-                "test": ModelUsageSummary(
-                    total_calls=10,
-                    total_input_tokens=10000,
-                    total_output_tokens=10000,
-                    total_cost=0.05,
-                )
-            }
+            model_usage_summaries={}
         )
 
         iteration = RLMIteration(prompt="test", response="code", code_blocks=[])

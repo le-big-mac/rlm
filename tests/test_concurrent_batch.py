@@ -75,7 +75,7 @@ class TestBatchedSubcallFnInREPL:
         repl = LocalREPL(subcall_batched_fn=batched_fn)
         repl.execute_code("rlm_query_batched(['q1'], model='custom')")
 
-        batched_fn.assert_called_once_with(["q1"], "custom")
+        batched_fn.assert_called_once_with(["q1"], "custom", None)
         repl.cleanup()
 
     def test_batched_fn_error_returns_error_strings(self):
@@ -117,7 +117,7 @@ class TestConcurrentExecution:
                 max_depth=3,
             )
 
-            def slow_subcall(prompt, model=None):
+            def slow_subcall(prompt, model=None, budget=None):
                 time.sleep(sleep_time)
                 return _make_completion(f"done: {prompt}")
 
@@ -143,25 +143,13 @@ class TestConcurrentExecution:
 
 
 class TestCumulativeCostIncludesChildren:
-    """_cumulative_cost must include both handler cost and child (accumulator) cost."""
+    """Accumulator total_cost must include both handler cost and child cost."""
 
-    def test_cumulative_cost_after_child_subcall(self):
-        """After a child reports cost via the accumulator, _check_iteration_limits
-        should compute _cumulative_cost = handler_cost + accumulator.total_cost."""
+    def test_accumulator_total_after_child_and_handler(self):
+        """After handler sync ($2) and child cost ($5), accumulator should report $7."""
         with patch.object(rlm_module, "get_client") as mock_gc:
             mock_lm = MagicMock()
             mock_lm.model_name = "test"
-            # Handler reports $2 cost
-            mock_lm.get_usage_summary.return_value = UsageSummary(
-                model_usage_summaries={
-                    "test": ModelUsageSummary(
-                        total_calls=1,
-                        total_input_tokens=100,
-                        total_output_tokens=50,
-                        total_cost=2.0,
-                    )
-                }
-            )
             mock_gc.return_value = mock_lm
 
             parent = RLM(
@@ -171,32 +159,28 @@ class TestCumulativeCostIncludesChildren:
                 max_budget=100.0,
             )
 
-            # Simulate child cost via the accumulator
+            # Simulate handler cost synced via _sync_handler_cost
+            parent._cost_accumulator.add_cost(2.0)
+            # Simulate child cost added in _subcall
             parent._cost_accumulator.add_cost(5.0)
 
-            # Create a dummy iteration with no errors
             from rlm.core.types import CodeBlock, REPLResult, RLMIteration
+            from rlm.core.lm_handler import LMHandler
 
             dummy_iter = RLMIteration(
-                prompt="x",
-                response="y",
+                prompt="x", response="y",
                 code_blocks=[
-                    CodeBlock(
-                        code="pass",
-                        result=REPLResult(stdout="", stderr="", locals={}),
-                    )
+                    CodeBlock(code="pass", result=REPLResult(stdout="", stderr="", locals={}))
                 ],
             )
 
-            from rlm.core.lm_handler import LMHandler
-
+            # Handler already synced, so mock returns 0 additional
             handler = MagicMock(spec=LMHandler)
-            handler.get_usage_summary.return_value = mock_lm.get_usage_summary.return_value
+            handler.get_usage_summary.return_value = UsageSummary(model_usage_summaries={})
 
             parent._check_iteration_limits(dummy_iter, 0, handler)
 
-            # _cumulative_cost should be handler(2) + accumulator(5) = 7
-            assert parent._cumulative_cost == 7.0
+            assert parent._cost_accumulator.total_cost == 7.0
 
             parent.close()
 
@@ -205,17 +189,6 @@ class TestCumulativeCostIncludesChildren:
         with patch.object(rlm_module, "get_client") as mock_gc:
             mock_lm = MagicMock()
             mock_lm.model_name = "test"
-            # Handler reports $3
-            mock_lm.get_usage_summary.return_value = UsageSummary(
-                model_usage_summaries={
-                    "test": ModelUsageSummary(
-                        total_calls=1,
-                        total_input_tokens=100,
-                        total_output_tokens=50,
-                        total_cost=3.0,
-                    )
-                }
-            )
             mock_gc.return_value = mock_lm
 
             parent = RLM(
@@ -225,27 +198,23 @@ class TestCumulativeCostIncludesChildren:
                 max_budget=5.0,
             )
 
-            # Child spent $4 via accumulator → total = 3 + 4 = 7 > 5
+            # Handler ($3) + child ($4) = $7 > $5 budget
+            parent._cost_accumulator.add_cost(3.0)
             parent._cost_accumulator.add_cost(4.0)
 
             from rlm.core.types import CodeBlock, REPLResult, RLMIteration
             from rlm.utils.exceptions import BudgetExceededError
+            from rlm.core.lm_handler import LMHandler
 
             dummy_iter = RLMIteration(
-                prompt="x",
-                response="y",
+                prompt="x", response="y",
                 code_blocks=[
-                    CodeBlock(
-                        code="pass",
-                        result=REPLResult(stdout="", stderr="", locals={}),
-                    )
+                    CodeBlock(code="pass", result=REPLResult(stdout="", stderr="", locals={}))
                 ],
             )
 
-            from rlm.core.lm_handler import LMHandler
-
             handler = MagicMock(spec=LMHandler)
-            handler.get_usage_summary.return_value = mock_lm.get_usage_summary.return_value
+            handler.get_usage_summary.return_value = UsageSummary(model_usage_summaries={})
 
             import pytest
 

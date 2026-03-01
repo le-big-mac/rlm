@@ -159,8 +159,8 @@ class RLM:
         else:
             self._cost_accumulator = CostAccumulator(max_budget=self.max_budget)
 
-        # Tracking (cumulative across all calls including children)
-        self._cumulative_cost: float = 0.0
+        # Last known handler cost, for computing deltas to sync into accumulator
+        self._last_handler_cost: float = 0.0
         self._consecutive_errors: int = 0
         self._last_error: str | None = None
         self._best_partial_answer: str | None = None
@@ -497,19 +497,18 @@ class RLM:
                 ),
             )
 
-        # Check budget
+        # Check budget (handler cost was already synced into the accumulator
+        # in _completion_turn, before code execution)
         if self.max_budget is not None:
-            current_usage = lm_handler.get_usage_summary()
-            handler_cost = current_usage.total_cost or 0.0
-            self._cumulative_cost = handler_cost + self._cost_accumulator.total_cost
-            if self._cumulative_cost > self.max_budget:
-                self.verbose.print_budget_exceeded(self._cumulative_cost, self.max_budget)
+            total_spent = self._cost_accumulator.total_cost
+            if total_spent > self.max_budget:
+                self.verbose.print_budget_exceeded(total_spent, self.max_budget)
                 raise BudgetExceededError(
-                    spent=self._cumulative_cost,
+                    spent=total_spent,
                     budget=self.max_budget,
                     message=(
                         f"Budget exceeded after iteration {iteration_num + 1}: "
-                        f"spent ${self._cumulative_cost:.6f} "
+                        f"spent ${total_spent:.6f} "
                         f"of ${self.max_budget:.6f} budget"
                     ),
                 )
@@ -592,6 +591,22 @@ class RLM:
         ]
         return new_history
 
+    def _sync_handler_cost(self, lm_handler: LMHandler) -> None:
+        """Record the handler's cost delta into the shared accumulator.
+
+        This ensures that ``remaining_budget`` reflects the parent's own LLM
+        spending, not just child costs.  Called before code execution (so
+        subcalls see accurate remaining budget) and in ``_check_iteration_limits``.
+        """
+        if self.max_budget is None:
+            return
+        current_usage = lm_handler.get_usage_summary()
+        handler_cost = current_usage.total_cost or 0.0
+        delta = handler_cost - self._last_handler_cost
+        if delta > 0:
+            self._cost_accumulator.add_cost(delta)
+            self._last_handler_cost = handler_cost
+
     def _completion_turn(
         self,
         prompt: str | dict[str, Any],
@@ -604,6 +619,11 @@ class RLM:
         """
         iter_start = time.perf_counter()
         response = lm_handler.completion(prompt)
+
+        # Record the handler's LLM cost BEFORE code execution so that
+        # subcalls see accurate remaining budget in the accumulator.
+        self._sync_handler_cost(lm_handler)
+
         code_block_strs = find_code_blocks(response)
         code_blocks = []
 
@@ -659,7 +679,7 @@ class RLM:
         elapsed = time.perf_counter() - self._completion_start_time
         return self.max_timeout - elapsed
 
-    def _subcall(self, prompt: str, model: str | None = None) -> RLMChatCompletion:
+    def _subcall(self, prompt: str, model: str | None = None, budget: float | None = None) -> RLMChatCompletion:
         """
         Handle a subcall from the environment, potentially spawning a child RLM.
 
@@ -673,6 +693,9 @@ class RLM:
             prompt: The prompt to process.
             model: Optional model name. If specified, the child RLM will use this model
                 instead of inheriting the parent's default backend.
+            budget: Optional budget cap (USD) for this child. If provided, reserves
+                exactly this amount (capped at remaining). If None, reserves all
+                remaining budget (fine for single calls).
 
         Returns:
             The full RLMChatCompletion from either a child RLM or plain LM completion.
@@ -743,7 +766,10 @@ class RLM:
                     usage_summary=UsageSummary(model_usage_summaries={}),
                     execution_time=0.0,
                 )
-            reservation = self._cost_accumulator.reserve(remaining or 0.0)
+            # If budget is provided (model-controlled), reserve exactly that amount;
+            # otherwise reserve all remaining (fine for single calls).
+            amount_to_reserve = budget if budget is not None else (remaining or 0.0)
+            reservation = self._cost_accumulator.reserve(amount_to_reserve)
 
         # Calculate remaining timeout for child (if timeout tracking enabled)
         remaining_timeout = self._get_remaining_timeout()
@@ -850,7 +876,7 @@ class RLM:
                     pass  # Don't let callback errors break execution
 
     def _subcall_batched(
-        self, prompts: list[str], model: str | None = None
+        self, prompts: list[str], model: str | None = None, budgets: list[float] | None = None
     ) -> list[RLMChatCompletion]:
         """Run multiple subcalls concurrently using a thread pool.
 
@@ -861,6 +887,9 @@ class RLM:
         Args:
             prompts: List of prompts to process concurrently.
             model: Optional model name override for all children.
+            budgets: Optional per-child budget caps (USD). If provided, each child
+                reserves its specified amount. If None, remaining budget is split
+                equally among children.
 
         Returns:
             List of RLMChatCompletion results in the same order as input prompts.
@@ -869,6 +898,14 @@ class RLM:
         if n == 0:
             return []
 
+        # Default budget allocation: split remaining budget equally when no
+        # explicit budgets are provided and budget tracking is enabled.
+        if budgets is None and self.max_budget is not None:
+            remaining = self._cost_accumulator.remaining_budget
+            if remaining is not None and remaining > 0:
+                per_child = remaining / n
+                budgets = [per_child] * n
+
         results: list[RLMChatCompletion | None] = [None] * n
         max_workers = min(n, 16)
 
@@ -876,11 +913,14 @@ class RLM:
             max_workers=max_workers, thread_name_prefix="rlm-batch"
         ) as executor:
             future_to_idx = {
-                executor.submit(self._subcall, p, model): i
+                executor.submit(
+                    self._subcall, p, model,
+                    budget=budgets[i] if budgets is not None else None,
+                ): i
                 for i, p in enumerate(prompts)
             }
-            remaining = self._get_remaining_timeout()
-            for future in as_completed(future_to_idx, timeout=remaining):
+            remaining_timeout = self._get_remaining_timeout()
+            for future in as_completed(future_to_idx, timeout=remaining_timeout):
                 idx = future_to_idx[future]
                 try:
                     results[idx] = future.result()

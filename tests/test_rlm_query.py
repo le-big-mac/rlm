@@ -27,7 +27,7 @@ class TestRlmQueryWithSubcallFn:
         result = repl.execute_code("response = rlm_query('hello')")
         assert result.stderr == ""
         assert repl.locals["response"] == "child response"
-        subcall_fn.assert_called_once_with("hello", None)
+        subcall_fn.assert_called_once_with("hello", None, None)
         repl.cleanup()
 
     def test_rlm_query_with_model_override(self):
@@ -36,7 +36,7 @@ class TestRlmQueryWithSubcallFn:
         repl = LocalREPL(subcall_fn=subcall_fn)
         repl.execute_code("response = rlm_query('hello', model='gpt-4')")
         assert repl.locals["response"] == "override response"
-        subcall_fn.assert_called_once_with("hello", "gpt-4")
+        subcall_fn.assert_called_once_with("hello", "gpt-4", None)
         repl.cleanup()
 
     def test_rlm_query_tracks_pending_calls(self):
@@ -146,7 +146,7 @@ class TestRlmQueryBatchedWithSubcallFn:
         repl = LocalREPL(subcall_fn=subcall_fn)
         repl.execute_code("answers = rlm_query_batched(['only one'])")
         assert repl.locals["answers"] == ["single"]
-        subcall_fn.assert_called_once_with("only one", None)
+        subcall_fn.assert_called_once_with("only one", None, None)
         repl.cleanup()
 
 
