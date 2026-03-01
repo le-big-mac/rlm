@@ -132,6 +132,7 @@ class LocalREPL(NonIsolatedEnv):
         persistent: bool = False,
         depth: int = 1,
         subcall_fn: Callable[[str, str | None], RLMChatCompletion] | None = None,
+        subcall_batched_fn: Callable[[list[str], str | None], list[RLMChatCompletion]] | None = None,
         custom_tools: dict[str, Any] | None = None,
         custom_sub_tools: dict[str, Any] | None = None,
         compaction: bool = False,
@@ -141,6 +142,7 @@ class LocalREPL(NonIsolatedEnv):
 
         self.lm_handler_address = lm_handler_address
         self.subcall_fn = subcall_fn  # Callback for recursive RLM calls (depth > 1 support)
+        self.subcall_batched_fn = subcall_batched_fn  # Concurrent batched subcalls
         self.original_cwd = os.getcwd()
         self.temp_dir = tempfile.mkdtemp(prefix=f"repl_env_{uuid.uuid4()}_")
         self._lock = threading.Lock()
@@ -319,7 +321,9 @@ class LocalREPL(NonIsolatedEnv):
         """Spawn recursive RLM sub-calls for multiple prompts.
 
         Each prompt gets its own child RLM for deeper thinking.
-        Falls back to llm_query_batched if no recursive capability is configured.
+        When subcall_batched_fn is available, children run concurrently via
+        ThreadPoolExecutor.  Falls back to sequential subcall_fn, then to
+        llm_query_batched if no recursive capability is configured.
 
         Args:
             prompts: List of prompts for child RLMs.
@@ -328,6 +332,17 @@ class LocalREPL(NonIsolatedEnv):
         Returns:
             List of responses in the same order as input prompts.
         """
+        # Prefer concurrent batched subcalls
+        if self.subcall_batched_fn is not None:
+            try:
+                completions = self.subcall_batched_fn(prompts, model)
+                for c in completions:
+                    self._pending_llm_calls.append(c)
+                return [c.response for c in completions]
+            except Exception as e:
+                return [f"Error: RLM batched query failed - {e}"] * len(prompts)
+
+        # Sequential fallback
         if self.subcall_fn is not None:
             results = []
             for prompt in prompts:

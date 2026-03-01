@@ -102,6 +102,37 @@ class UsageSummary:
             result["total_cost"] = self.total_cost
         return result
 
+    def merge(self, other: "UsageSummary") -> "UsageSummary":
+        """Combine two UsageSummaries, summing per-model tokens/calls/costs."""
+        merged: dict[str, ModelUsageSummary] = {}
+        for model, summary in self.model_usage_summaries.items():
+            merged[model] = ModelUsageSummary(
+                total_calls=summary.total_calls,
+                total_input_tokens=summary.total_input_tokens,
+                total_output_tokens=summary.total_output_tokens,
+                total_cost=summary.total_cost,
+            )
+        for model, summary in other.model_usage_summaries.items():
+            if model in merged:
+                existing = merged[model]
+                cost = None
+                if existing.total_cost is not None or summary.total_cost is not None:
+                    cost = (existing.total_cost or 0.0) + (summary.total_cost or 0.0)
+                merged[model] = ModelUsageSummary(
+                    total_calls=existing.total_calls + summary.total_calls,
+                    total_input_tokens=existing.total_input_tokens + summary.total_input_tokens,
+                    total_output_tokens=existing.total_output_tokens + summary.total_output_tokens,
+                    total_cost=cost,
+                )
+            else:
+                merged[model] = ModelUsageSummary(
+                    total_calls=summary.total_calls,
+                    total_input_tokens=summary.total_input_tokens,
+                    total_output_tokens=summary.total_output_tokens,
+                    total_cost=summary.total_cost,
+                )
+        return UsageSummary(model_usage_summaries=merged)
+
     @classmethod
     def from_dict(cls, data: dict) -> "UsageSummary":
         return cls(

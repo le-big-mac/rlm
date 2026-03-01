@@ -1,9 +1,11 @@
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from typing import Any
 
 from rlm.clients import BaseLM, get_client
+from rlm.core.cost_tracker import CostAccumulator
 from rlm.core.lm_handler import LMHandler
 from rlm.core.types import (
     ClientBackend,
@@ -74,6 +76,7 @@ class RLM:
         on_subcall_complete: Callable[[int, str, float, str | None], None] | None = None,
         on_iteration_start: Callable[[int, int], None] | None = None,
         on_iteration_complete: Callable[[int, int, float], None] | None = None,
+        _cost_accumulator: CostAccumulator | None = None,
     ):
         """
         Args:
@@ -149,6 +152,12 @@ class RLM:
         self.on_subcall_complete = on_subcall_complete
         self.on_iteration_start = on_iteration_start
         self.on_iteration_complete = on_iteration_complete
+
+        # Thread-safe cost tracking across the entire RLM tree
+        if _cost_accumulator is not None:
+            self._cost_accumulator = _cost_accumulator
+        else:
+            self._cost_accumulator = CostAccumulator(max_budget=self.max_budget)
 
         # Tracking (cumulative across all calls including children)
         self._cumulative_cost: float = 0.0
@@ -231,6 +240,7 @@ class RLM:
             # For local environment with max_depth > 1, pass subcall callback for recursive RLM calls
             if self.environment_type == "local" and self.max_depth > 1:
                 env_kwargs["subcall_fn"] = self._subcall
+                env_kwargs["subcall_batched_fn"] = self._subcall_batched
             # Pass custom tools to the environment
             if self.custom_tools is not None:
                 env_kwargs["custom_tools"] = self.custom_tools
@@ -490,8 +500,8 @@ class RLM:
         # Check budget
         if self.max_budget is not None:
             current_usage = lm_handler.get_usage_summary()
-            current_cost = current_usage.total_cost or 0.0
-            self._cumulative_cost = current_cost
+            handler_cost = current_usage.total_cost or 0.0
+            self._cumulative_cost = handler_cost + self._cost_accumulator.total_cost
             if self._cumulative_cost > self.max_budget:
                 self.verbose.print_budget_exceeded(self._cumulative_cost, self.max_budget)
                 raise BudgetExceededError(
@@ -642,6 +652,13 @@ class RLM:
         response = client.completion(message)
         return response
 
+    def _get_remaining_timeout(self) -> float | None:
+        """Return seconds remaining on the timeout, or None if no timeout set."""
+        if self.max_timeout is None or self._completion_start_time is None:
+            return None
+        elapsed = time.perf_counter() - self._completion_start_time
+        return self.max_timeout - elapsed
+
     def _subcall(self, prompt: str, model: str | None = None) -> RLMChatCompletion:
         """
         Handle a subcall from the environment, potentially spawning a child RLM.
@@ -649,6 +666,8 @@ class RLM:
         This method is passed as a callback to LocalREPL to enable recursive RLM calls.
         When depth allows, it spawns a child RLM with its own REPL. At max depth,
         it falls back to a plain LM completion.
+
+        Thread-safe: all shared cost mutation goes through self._cost_accumulator.
 
         Args:
             prompt: The prompt to process.
@@ -683,6 +702,14 @@ class RLM:
                 end_time = time.perf_counter()
                 model_usage = client.get_last_usage()
                 usage_summary = UsageSummary(model_usage_summaries={root_model: model_usage})
+                # Record leaf-node cost in the shared accumulator
+                leaf_cost = usage_summary.total_cost or 0.0
+                self._cost_accumulator.add_cost(
+                    leaf_cost,
+                    input_tokens=usage_summary.total_input_tokens,
+                    output_tokens=usage_summary.total_output_tokens,
+                    calls=1,
+                )
                 return RLMChatCompletion(
                     root_model=root_model,
                     prompt=prompt,
@@ -700,35 +727,38 @@ class RLM:
                     execution_time=end_time - start_time,
                 )
 
-        # Calculate remaining budget for child (if budget tracking enabled)
-        remaining_budget = None
+        # Reserve budget for this child (if budget tracking enabled)
+        reservation: float = 0.0
         if self.max_budget is not None:
-            remaining_budget = self.max_budget - self._cumulative_cost
-            if remaining_budget <= 0:
+            remaining = self._cost_accumulator.remaining_budget
+            if remaining is not None and remaining <= 0:
                 return RLMChatCompletion(
                     root_model=resolved_model,
                     prompt=prompt,
                     response=(
                         "Error: Budget exhausted "
-                        f"(spent ${self._cumulative_cost:.6f} of ${self.max_budget:.6f})"
+                        f"(spent ${self._cost_accumulator.total_cost:.6f} "
+                        f"of ${self.max_budget:.6f})"
                     ),
                     usage_summary=UsageSummary(model_usage_summaries={}),
                     execution_time=0.0,
                 )
+            reservation = self._cost_accumulator.reserve(remaining or 0.0)
 
         # Calculate remaining timeout for child (if timeout tracking enabled)
-        remaining_timeout = None
-        if self.max_timeout is not None and self._completion_start_time is not None:
+        remaining_timeout = self._get_remaining_timeout()
+        if remaining_timeout is not None and remaining_timeout <= 0:
+            # Release reservation before returning
+            if reservation > 0:
+                self._cost_accumulator.commit(0.0, reservation)
             elapsed = time.perf_counter() - self._completion_start_time
-            remaining_timeout = self.max_timeout - elapsed
-            if remaining_timeout <= 0:
-                return RLMChatCompletion(
-                    root_model=resolved_model,
-                    prompt=prompt,
-                    response=f"Error: Timeout exhausted ({elapsed:.1f}s of {self.max_timeout:.1f}s)",
-                    usage_summary=UsageSummary(model_usage_summaries={}),
-                    execution_time=0.0,
-                )
+            return RLMChatCompletion(
+                root_model=resolved_model,
+                prompt=prompt,
+                response=f"Error: Timeout exhausted ({elapsed:.1f}s of {self.max_timeout:.1f}s)",
+                usage_summary=UsageSummary(model_usage_summaries={}),
+                execution_time=0.0,
+            )
 
         # Resolve the model name for callbacks
         prompt_preview = prompt[:80] if len(prompt) > 80 else prompt
@@ -743,6 +773,9 @@ class RLM:
         subcall_start = time.perf_counter()
         error_msg: str | None = None
 
+        # Child gets its own budget = its reservation (None if no budget tracking)
+        child_budget = reservation if self.max_budget is not None else None
+
         # Spawn a child RLM with its own LocalREPL
         child = RLM(
             backend=self.backend,
@@ -752,7 +785,7 @@ class RLM:
             depth=next_depth,
             max_depth=self.max_depth,
             max_iterations=self.max_iterations,
-            max_budget=remaining_budget,
+            max_budget=child_budget,
             max_timeout=remaining_timeout,
             max_tokens=self.max_tokens,
             max_errors=self.max_errors,
@@ -768,16 +801,24 @@ class RLM:
             # Propagate callbacks to children for nested tracking
             on_subcall_start=self.on_subcall_start,
             on_subcall_complete=self.on_subcall_complete,
+            # Share the cost accumulator across the tree
+            _cost_accumulator=self._cost_accumulator,
         )
         try:
             result = child.completion(prompt, root_prompt=None)
-            # Track child's cost in parent's cumulative cost
-            if result.usage_summary and result.usage_summary.total_cost:
-                self._cumulative_cost += result.usage_summary.total_cost
+            # Commit child's actual cost, releasing unused reservation
+            child_cost = result.usage_summary.total_cost or 0.0 if result.usage_summary else 0.0
+            self._cost_accumulator.commit(
+                child_cost,
+                reservation,
+                input_tokens=result.usage_summary.total_input_tokens if result.usage_summary else 0,
+                output_tokens=result.usage_summary.total_output_tokens if result.usage_summary else 0,
+                calls=1,
+            )
             return result
         except BudgetExceededError as e:
-            # Propagate child's spending to parent
-            self._cumulative_cost += e.spent
+            # Commit whatever the child actually spent
+            self._cost_accumulator.commit(e.spent, reservation)
             error_msg = f"Budget exceeded - {e}"
             return RLMChatCompletion(
                 root_model=resolved_model,
@@ -787,6 +828,8 @@ class RLM:
                 execution_time=time.perf_counter() - subcall_start,
             )
         except Exception as e:
+            # Release reservation on failure (no cost incurred)
+            self._cost_accumulator.commit(0.0, reservation)
             error_msg = str(e)
             return RLMChatCompletion(
                 root_model=resolved_model,
@@ -805,6 +848,55 @@ class RLM:
                     self.on_subcall_complete(next_depth, str(resolved_model), duration, error_msg)
                 except Exception:
                     pass  # Don't let callback errors break execution
+
+    def _subcall_batched(
+        self, prompts: list[str], model: str | None = None
+    ) -> list[RLMChatCompletion]:
+        """Run multiple subcalls concurrently using a thread pool.
+
+        Each _subcall is already thread-safe (all shared cost mutation goes through
+        the lock-protected CostAccumulator).  Children are fully isolated (own
+        handler, own REPL, own clients).
+
+        Args:
+            prompts: List of prompts to process concurrently.
+            model: Optional model name override for all children.
+
+        Returns:
+            List of RLMChatCompletion results in the same order as input prompts.
+        """
+        n = len(prompts)
+        if n == 0:
+            return []
+
+        results: list[RLMChatCompletion | None] = [None] * n
+        max_workers = min(n, 16)
+
+        with ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="rlm-batch"
+        ) as executor:
+            future_to_idx = {
+                executor.submit(self._subcall, p, model): i
+                for i, p in enumerate(prompts)
+            }
+            remaining = self._get_remaining_timeout()
+            for future in as_completed(future_to_idx, timeout=remaining):
+                idx = future_to_idx[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    resolved_model = model or (
+                        (self.backend_kwargs or {}).get("model_name", "unknown")
+                    )
+                    results[idx] = RLMChatCompletion(
+                        root_model=resolved_model,
+                        prompt=prompts[idx],
+                        response=f"Error: Batched subcall failed - {e}",
+                        usage_summary=UsageSummary(model_usage_summaries={}),
+                        execution_time=0.0,
+                    )
+
+        return results
 
     def _validate_persistent_environment_support(self) -> None:
         """
