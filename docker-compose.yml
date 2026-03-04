@@ -1,0 +1,94 @@
+# Usage:
+#   docker compose build
+#   docker compose up qwen          # Serve Qwen3.5-27B-FP8 on GPU 0
+#   docker compose up glm           # Serve GLM-4.7-FP8 on all 4 GPUs
+#   docker compose run rlm          # Interactive shell to run rlm scripts
+#   docker compose run rlm python examples/qwen_vllm.py   # One-off script
+#   docker compose up visualizer    # Trajectory viewer on port 3000
+#   docker compose down             # Stop everything
+
+services:
+  qwen:
+    build: .
+    image: rlm-vllm
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - /data:/data
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0", "1"]
+              capabilities: [gpu]
+    command:
+      - "Qwen/Qwen3.5-27B-FP8"
+      - "--host=0.0.0.0"
+      - "--port=8000"
+      - "--tensor-parallel-size=2"
+      - "--max-model-len=262144"
+      - "--gpu-memory-utilization=0.90"
+      - "--dtype=auto"
+      - "--trust-remote-code"
+      - "--enable-prefix-caching"
+      - "--kv-cache-dtype=fp8"
+      - "--served-model-name=qwen3.5-27b"
+
+  glm:
+    build: .
+    image: rlm-vllm
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - /data:/data
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command:
+      - "zai-org/GLM-4.7-FP8"
+      - "--host=0.0.0.0"
+      - "--port=8000"
+      - "--tensor-parallel-size=4"
+      - "--max-model-len=8192"
+      - "--gpu-memory-utilization=0.90"
+      - "--dtype=auto"
+      - "--trust-remote-code"
+      - "--tool-call-parser=glm47"
+      - "--reasoning-parser=glm45"
+      - "--enable-auto-tool-choice"
+      - "--speculative-config.method=mtp"
+      - "--speculative-config.num_speculative_tokens=1"
+      - "--served-model-name=glm-4.7"
+
+  visualizer:
+    image: node:22-slim
+    working_dir: /app
+    volumes:
+      - ./visualizer:/app
+      - ./logs:/app/public/logs
+    ports:
+      - "3000:3000"
+    command: ["sh", "-c", "npm install && npm run dev"]
+
+  rlm:
+    build: .
+    image: rlm-vllm
+    volumes:
+      - /data:/data
+      - ./logs:/app/logs
+      - ./examples:/app/examples
+      - ./data:/app/data
+    network_mode: host
+    entrypoint: []
+    command: ["/bin/bash"]
+    stdin_open: true
+    tty: true

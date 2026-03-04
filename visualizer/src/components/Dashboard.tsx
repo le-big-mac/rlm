@@ -185,7 +185,7 @@ export function Dashboard() {
                     </CardContent>
                   </Card>
                 ) : (
-                  <ScrollArea className="h-[320px]">
+                  <ScrollArea className="h-[600px]">
                     <div className="space-y-2 pr-4">
                       {demoLogs.map((demo) => (
                         <Card
